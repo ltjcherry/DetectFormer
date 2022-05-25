@@ -1,0 +1,72 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+from abc import ABCMeta, abstractmethod
+from collections import OrderedDict
+
+import mmcv
+import numpy as np
+import torch
+import torch.distributed as dist
+from mmcv.runner import BaseModule, auto_fp16
+
+from mmdet.core.visualization import imshow_det_bboxes
+
+
+class BaseDetector(BaseModule, metaclass=ABCMeta):
+    """Base class for detectors."""
+
+    def __init__(self, init_cfg=None):
+        super(BaseDetector, self).__init__(init_cfg)
+        self.fp16_enabled = False
+
+    @property
+    def with_neck(self):
+        """bool: whether the detector has a neck"""
+        return hasattr(self, 'neck') and self.neck is not None
+
+    # TODO: these properties need to be carefully handled
+    # for both single stage & two stage detectors
+    @property
+    def with_shared_head(self):
+        """bool: whether the detector has a shared head in the RoI Head"""
+        return hasattr(self, 'roi_head') and self.roi_head.with_shared_head
+
+    @property
+    def with_bbox(self):
+        """bool: whether the detector has a bbox head"""
+        return ((hasattr(self, 'roi_head') and self.roi_head.with_bbox)
+                or (hasattr(self, 'bbox_head') and self.bbox_head is not None))
+
+    @property
+    def with_mask(self):
+        """bool: whether the detector has a mask head"""
+        return ((hasattr(self, 'roi_head') and self.roi_head.with_mask)
+                or (hasattr(self, 'mask_head') and self.mask_head is not None))
+
+    @abstractmethod
+    def extract_feat(self, imgs):
+        """Extract features from images."""
+        pass
+
+    def extract_feats(self, imgs):
+        """Extract features from multiple images.
+
+        Args:
+            imgs (list[torch.Tensor]): A list of images. The images are
+                augmented from the same image but in different ways.
+
+        Returns:
+            list[torch.Tensor]: Features of different images
+        """
+        assert isinstance(imgs, list)
+        return [self.extract_feat(img) for img in imgs]
+
+    def forward_train(self, imgs, img_metas, **kwargs):
+        """
+        Args:
+            img (list[Tensor]): List of tensors of shape (1, C, H, W).
+                Typically these should be mean centered and std scaled.
+            img_metas (list[dict]): List of image info dict where each dict
+                has: 'img_shape', 'scale_factor', 'flip', and may also contain
+                'filename', 'ori_shape', 'pad_shape', and 'img_norm_cfg'.
+                For details on the values of these keys, see
+                :class:`mmde
