@@ -1,0 +1,85 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+from abc import ABCMeta, abstractmethod
+
+import cv2
+import mmcv
+import numpy as np
+import pycocotools.mask as maskUtils
+import torch
+from mmcv.ops.roi_align import roi_align
+
+
+class BaseInstanceMasks(metaclass=ABCMeta):
+    """Base class for instance masks."""
+
+    @abstractmethod
+    def rescale(self, scale, interpolation='nearest'):
+        """Rescale masks as large as possible while keeping the aspect ratio.
+        For details can refer to `mmcv.imrescale`.
+
+        Args:
+            scale (tuple[int]): The maximum size (h, w) of rescaled mask.
+            interpolation (str): Same as :func:`mmcv.imrescale`.
+
+        Returns:
+            BaseInstanceMasks: The rescaled masks.
+        """
+
+    @abstractmethod
+    def resize(self, out_shape, interpolation='nearest'):
+        """Resize masks to the given out_shape.
+
+        Args:
+            out_shape: Target (h, w) of resized mask.
+            interpolation (str): See :func:`mmcv.imresize`.
+
+        Returns:
+            BaseInstanceMasks: The resized masks.
+        """
+
+    @abstractmethod
+    def flip(self, flip_direction='horizontal'):
+        """Flip masks alone the given direction.
+
+        Args:
+            flip_direction (str): Either 'horizontal' or 'vertical'.
+
+        Returns:
+            BaseInstanceMasks: The flipped masks.
+        """
+
+    @abstractmethod
+    def pad(self, out_shape, pad_val):
+        """Pad masks to the given size of (h, w).
+
+        Args:
+            out_shape (tuple[int]): Target (h, w) of padded mask.
+            pad_val (int): The padded value.
+
+        Returns:
+            BaseInstanceMasks: The padded masks.
+        """
+
+    @abstractmethod
+    def crop(self, bbox):
+        """Crop each mask by the given bbox.
+
+        Args:
+            bbox (ndarray): Bbox in format [x1, y1, x2, y2], shape (4, ).
+
+        Return:
+            BaseInstanceMasks: The cropped masks.
+        """
+
+    @abstractmethod
+    def crop_and_resize(self,
+                        bboxes,
+                        out_shape,
+                        inds,
+                        device,
+                        interpolation='bilinear',
+                        binarize=True):
+        """Crop and resize masks by the given bboxes.
+
+        This function is mainly used in mask targets computation.
+        It firstly align mask to bboxes by assigned_inds, then crop mask by t

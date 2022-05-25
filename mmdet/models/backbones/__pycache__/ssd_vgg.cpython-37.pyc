@@ -1,0 +1,100 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+import warnings
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from mmcv.cnn import Scale
+from mmcv.runner import force_fp32
+
+from mmdet.core import multi_apply, reduce_mean
+from ..builder import HEADS, build_loss
+from mmcv.cnn import Conv2d, Linear, build_activation_layer
+from mmcv.cnn.bricks.transformer import FFN, build_positional_encoding
+from mmdet.models.utils import build_transformer
+from .anchor_free_head import AnchorFreeHead
+
+INF = 1e8
+
+
+@HEADS.register_module()
+class NiuHead(AnchorFreeHead):
+    """Anchor-free head used in `FCOS <https://arxiv.org/abs/1904.01355>`_.
+
+    The FCOS head does not use anchor boxes. Instead bounding boxes are
+    predicted at each pixel and a centerness measure is used to suppress
+    low-quality predictions.
+    Here norm_on_bbox, centerness_on_reg, dcn_on_last_conv are training
+    tricks used in official repo, which will bring remarkable mAP gains
+    of up to 4.9. Please see https://github.com/tianzhi0549/FCOS for
+    more detail.
+
+    Args:
+        num_classes (int): Number of categories excluding the background
+            category.
+        in_channels (int): Number of channels in the input feature map.
+        strides (list[int] | list[tuple[int, int]]): Strides of points
+            in multiple feature levels. Default: (4, 8, 16, 32, 64).
+        regress_ranges (tuple[tuple[int, int]]): Regress range of multiple
+            level points.
+        center_sampling (bool): If true, use center sampling. Default: False.
+        center_sample_radius (float): Radius of center sampling. Default: 1.5.
+        norm_on_bbox (bool): If true, normalize the regression targets
+            with FPN strides. Default: False.
+        centerness_on_reg (bool): If true, position centerness on the
+            regress branch. Please refer to https://github.com/tianzhi0549/FCOS/issues/89#issuecomment-516877042.
+            Default: False.
+        conv_bias (bool | str): If specified as `auto`, it will be decided by the
+            norm_cfg. Bias of conv will be set as True if `norm_cfg` is None, otherwise
+            False. Default: "auto".
+        loss_cls (dict): Config of classification loss.
+        loss_bbox (dict): Config of localization loss.
+        loss_centerness (dict): Config of centerness loss.
+        norm_cfg (dict): dictionary to construct and config norm layer.
+            Default: norm_cfg=dict(type='GN', num_groups=32, requires_grad=True).
+        init_cfg (dict or list[dict], optional): Initialization config dict.
+
+    Example:
+        >>> self = FCOSHead(11, 7)
+        >>> feats = [torch.rand(1, 7, s, s) for s in [4, 8, 16, 32, 64]]
+        >>> cls_score, bbox_pred, centerness = self.forward(feats)
+        >>> assert len(cls_score) == len(self.scales)
+    """  # noqa: E501
+
+    def __init__(self,
+                 num_classes,
+                 in_channels,
+                 num_query=100,
+                 transformer=None,
+                 regress_ranges=((-1, 64), (64, 128), (128, 256), (256, 512),
+                                 (512, INF)),
+                 center_sampling=False,
+                 center_sample_radius=1.5,
+                 norm_on_bbox=False,
+                 centerness_on_reg=False,
+                 loss_cls=dict(
+                     type='FocalLoss',
+                     use_sigmoid=True,
+                     gamma=2.0,
+                     alpha=0.25,
+                     loss_weight=1.0),
+                 loss_bbox=dict(type='L1Loss', loss_weight=5.0),
+                #  loss_iou=dict(type='GIoULoss', loss_weight=2.0),
+                 loss_centerness=dict(
+                     type='CrossEntropyLoss',
+                     use_sigmoid=True,
+                     loss_weight=1.0),
+                 norm_cfg=dict(type='GN', num_groups=32, requires_grad=True),
+                 init_cfg=dict(
+                     type='Normal',
+                     layer='Conv2d',
+                     std=0.01,
+                     override=dict(
+                         type='Normal',
+                         name='conv_cls',
+                         std=0.01,
+                         bias_prob=0.01)),
+                 **kwargs):
+        self.regress_ranges = regress_ranges
+        self.center_sampling = center_sampling
+        self.center_sample_radius = cen

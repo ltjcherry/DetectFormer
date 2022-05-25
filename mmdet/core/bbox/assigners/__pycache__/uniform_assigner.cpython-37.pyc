@@ -1,0 +1,78 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+import mmcv
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from ..builder import BBOX_CODERS
+from ..transforms import bbox_rescale
+from .base_bbox_coder import BaseBBoxCoder
+
+
+@BBOX_CODERS.register_module()
+class BucketingBBoxCoder(BaseBBoxCoder):
+    """Bucketing BBox Coder for Side-Aware Boundary Localization (SABL).
+
+    Boundary Localization with Bucketing and Bucketing Guided Rescoring
+    are implemented here.
+
+    Please refer to https://arxiv.org/abs/1912.04260 for more details.
+
+    Args:
+        num_buckets (int): Number of buckets.
+        scale_factor (int): Scale factor of proposals to generate buckets.
+        offset_topk (int): Topk buckets are used to generate
+             bucket fine regression targets. Defaults to 2.
+        offset_upperbound (float): Offset upperbound to generate
+             bucket fine regression targets.
+             To avoid too large offset displacements. Defaults to 1.0.
+        cls_ignore_neighbor (bool): Ignore second nearest bucket or Not.
+             Defaults to True.
+        clip_border (bool, optional): Whether clip the objects outside the
+            border of the image. Defaults to True.
+    """
+
+    def __init__(self,
+                 num_buckets,
+                 scale_factor,
+                 offset_topk=2,
+                 offset_upperbound=1.0,
+                 cls_ignore_neighbor=True,
+                 clip_border=True):
+        super(BucketingBBoxCoder, self).__init__()
+        self.num_buckets = num_buckets
+        self.scale_factor = scale_factor
+        self.offset_topk = offset_topk
+        self.offset_upperbound = offset_upperbound
+        self.cls_ignore_neighbor = cls_ignore_neighbor
+        self.clip_border = clip_border
+
+    def encode(self, bboxes, gt_bboxes):
+        """Get bucketing estimation and fine regression targets during
+        training.
+
+        Args:
+            bboxes (torch.Tensor): source boxes, e.g., object proposals.
+            gt_bboxes (torch.Tensor): target of the transformation, e.g.,
+                ground truth boxes.
+
+        Returns:
+           encoded_bboxes(tuple[Tensor]): bucketing estimation
+            and fine regression targets and weights
+        """
+
+        assert bboxes.size(0) == gt_bboxes.size(0)
+        assert bboxes.size(-1) == gt_bboxes.size(-1) == 4
+        encoded_bboxes = bbox2bucket(bboxes, gt_bboxes, self.num_buckets,
+                                     self.scale_factor, self.offset_topk,
+                                     self.offset_upperbound,
+                                     self.cls_ignore_neighbor)
+        return encoded_bboxes
+
+    def decode(self, bboxes, pred_bboxes, max_shape=None):
+        """Apply transformation `pred_bboxes` to `boxes`.
+        Args:
+            boxes (torch.Tensor): Basic boxes.
+            pred_bboxes (torch.Tensor): Predictions for bucketing estimation
+                and fine regression
+     

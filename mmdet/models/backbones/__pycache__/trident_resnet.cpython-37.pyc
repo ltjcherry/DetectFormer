@@ -1,0 +1,222 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+import warnings
+
+import torch
+import torch.nn as nn
+from mmcv.runner import force_fp32
+
+from mmdet.core import (anchor_inside_flags, build_assigner, build_bbox_coder,
+                        build_prior_generator, build_sampler, images_to_levels,
+                        multi_apply, unmap)
+from ..builder import HEADS, build_loss
+from .base_dense_head import BaseDenseHead
+from .dense_test_mixins import BBoxTestMixin
+
+
+@HEADS.register_module()
+class AnchorHead(BaseDenseHead, BBoxTestMixin):
+    """Anchor-based head (RPN, RetinaNet, SSD, etc.).
+
+    Args:
+        num_classes (int): Number of categories excluding the background
+            category.
+        in_channels (int): Number of channels in the input feature map.
+        feat_channels (int): Number of hidden channels. Used in child classes.
+        anchor_generator (dict): Config dict for anchor generator
+        bbox_coder (dict): Config of bounding box coder.
+        reg_decoded_bbox (bool): If true, the regression loss would be
+            applied directly on decoded bounding boxes, converting both
+            the predicted boxes and regression targets to absolute
+            coordinates format. Default False. It should be `True` when
+            using `IoULoss`, `GIoULoss`, or `DIoULoss` in the bbox head.
+        loss_cls (dict): Config of classification loss.
+        loss_bbox (dict): Config of localization loss.
+        train_cfg (dict): Training config of anchor head.
+        test_cfg (dict): Testing config of anchor head.
+        init_cfg (dict or list[dict], optional): Initialization config dict.
+    """  # noqa: W605
+
+    def __init__(self,
+                 num_classes,
+                 in_channels,
+                 feat_channels=256,
+                 anchor_generator=dict(
+                     type='AnchorGenerator',
+                     scales=[8, 16, 32],
+                     ratios=[0.5, 1.0, 2.0],
+                     strides=[4, 8, 16, 32, 64]),
+                 bbox_coder=dict(
+                     type='DeltaXYWHBBoxCoder',
+                     clip_border=True,
+                     target_means=(.0, .0, .0, .0),
+                     target_stds=(1.0, 1.0, 1.0, 1.0)),
+                 reg_decoded_bbox=False,
+                 loss_cls=dict(
+                     type='CrossEntropyLoss',
+                     use_sigmoid=True,
+                     loss_weight=1.0),
+                 loss_bbox=dict(
+                     type='SmoothL1Loss', beta=1.0 / 9.0, loss_weight=1.0),
+                 train_cfg=None,
+                 test_cfg=None,
+                 init_cfg=dict(type='Normal', layer='Conv2d', std=0.01)):
+        super(AnchorHead, self).__init__(init_cfg)
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.feat_channels = feat_channels
+        self.use_sigmoid_cls = loss_cls.get('use_sigmoid', False)
+        if self.use_sigmoid_cls:
+            self.cls_out_channels = num_classes
+        else:
+            self.cls_out_channels = num_classes + 1
+
+        if self.cls_out_channels <= 0:
+            raise ValueError(f'num_classes={num_classes} is too small')
+        self.reg_decoded_bbox = reg_decoded_bbox
+
+        self.bbox_coder = build_bbox_coder(bbox_coder)
+        self.loss_cls = build_loss(loss_cls)
+        self.loss_bbox = build_loss(loss_bbox)
+        self.train_cfg = train_cfg
+        self.test_cfg = test_cfg
+        if self.train_cfg:
+            self.assigner = build_assigner(self.train_cfg.assigner)
+            if hasattr(self.train_cfg,
+                       'sampler') and self.train_cfg.sampler.type.split(
+                           '.')[-1] != 'PseudoSampler':
+                self.sampling = True
+                sampler_cfg = self.train_cfg.sampler
+                # avoid BC-breaking
+                if loss_cls['type'] in [
+                        'FocalLoss', 'GHMC', 'QualityFocalLoss'
+                ]:
+                    warnings.warn(
+                        'DeprecationWarning: Determining whether to sampling'
+                        'by loss type is deprecated, please delete sampler in'
+                        'your config when using `FocalLoss`, `GHMC`, '
+                        '`QualityFocalLoss` or other FocalLoss variant.')
+                    self.sampling = False
+                    sampler_cfg = dict(type='PseudoSampler')
+            else:
+                self.sampling = False
+                sampler_cfg = dict(type='PseudoSampler')
+            self.sampler = build_sampler(sampler_cfg, context=self)
+        self.fp16_enabled = False
+
+        self.prior_generator = build_prior_generator(anchor_generator)
+
+        # Usually the numbers of anchors for each level are the same
+        # except SSD detectors. So it is an int in the most dense
+        # heads but a list of int in SSDHead
+        self.num_base_priors = self.prior_generator.num_base_priors[0]
+        self._init_layers()
+
+    @property
+    def num_anchors(self):
+        warnings.warn('DeprecationWarning: `num_anchors` is deprecated, '
+                      'for consistency or also use '
+                      '`num_base_priors` instead')
+        return self.prior_generator.num_base_priors[0]
+
+    @property
+    def anchor_generator(self):
+        warnings.warn('DeprecationWarning: anchor_generator is deprecated, '
+                      'please use "prior_generator" instead')
+        return self.prior_generator
+
+    def _init_layers(self):
+        """Initialize layers of the head."""
+        self.conv_cls = nn.Conv2d(self.in_channels,
+                                  self.num_base_priors * self.cls_out_channels,
+                                  1)
+        self.conv_reg = nn.Conv2d(self.in_channels, self.num_base_priors * 4,
+                                  1)
+
+    def forward_single(self, x):
+        """Forward feature of a single scale level.
+
+        Args:
+            x (Tensor): Features of a single scale level.
+
+        Returns:
+            tuple:
+                cls_score (Tensor): Cls scores for a single scale level \
+                    the channels number is num_base_priors * num_classes.
+                bbox_pred (Tensor): Box energies / deltas for a single scale \
+                    level, the channels number is num_base_priors * 4.
+        """
+        cls_score = self.conv_cls(x)
+        bbox_pred = self.conv_reg(x)
+        return cls_score, bbox_pred
+
+    def forward(self, feats):
+        """Forward features from the upstream network.
+
+        Args:
+            feats (tuple[Tensor]): Features from the upstream network, each is
+                a 4D-tensor.
+
+        Returns:
+            tuple: A tuple of classification scores and bbox prediction.
+
+                - cls_scores (list[Tensor]): Classification scores for all \
+                    scale levels, each is a 4D-tensor, the channels number \
+                    is num_base_priors * num_classes.
+                - bbox_preds (list[Tensor]): Box energies / deltas for all \
+                    scale levels, each is a 4D-tensor, the channels number \
+                    is num_base_priors * 4.
+        """
+        return multi_apply(self.forward_single, feats)
+
+    def get_anchors(self, featmap_sizes, img_metas, device='cuda'):
+        """Get anchors according to feature map sizes.
+
+        Args:
+            featmap_sizes (list[tuple]): Multi-level feature map sizes.
+            img_metas (list[dict]): Image meta info.
+            device (torch.device | str): Device for returned tensors
+
+        Returns:
+            tuple:
+                anchor_list (list[Tensor]): Anchors of each image.
+                valid_flag_list (list[Tensor]): Valid flags of each image.
+        """
+        num_imgs = len(img_metas)
+
+        # since feature map sizes of all images are the same, we only compute
+        # anchors for one time
+        multi_level_anchors = self.prior_generator.grid_priors(
+            featmap_sizes, device=device)
+        anchor_list = [multi_level_anchors for _ in range(num_imgs)]
+
+        # for each image, we compute valid flags of multi level anchors
+        valid_flag_list = []
+        for img_id, img_meta in enumerate(img_metas):
+            multi_level_flags = self.prior_generator.valid_flags(
+                featmap_sizes, img_meta['pad_shape'], device)
+            valid_flag_list.append(multi_level_flags)
+
+        return anchor_list, valid_flag_list
+
+    def _get_targets_single(self,
+                            flat_anchors,
+                            valid_flags,
+                            gt_bboxes,
+                            gt_bboxes_ignore,
+                            gt_labels,
+                            img_meta,
+                            label_channels=1,
+                            unmap_outputs=True):
+        """Compute regression and classification targets for anchors in a
+        single image.
+
+        Args:
+            flat_anchors (Tensor): Multi-level anchors of the image, which are
+                concatenated into a single tensor of shape (num_anchors ,4)
+            valid_flags (Tensor): Multi level valid flags of the image,
+                which are concatenated into a single tensor of
+                    shape (num_anchors,).
+            gt_bboxes (Tensor): Ground truth bboxes of the image,
+                shape (num_gts, 4).
+            gt_bboxes_ignore (Tensor): Ground truth bboxes to be
+                ignored, shape (num_ignored_gts, 4

@@ -1,0 +1,36 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+import mmcv
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from ..builder import LOSSES
+
+
+@mmcv.jit(derivate=True, coderize=True)
+def ae_loss_per_image(tl_preds, br_preds, match):
+    """Associative Embedding Loss in one image.
+
+    Associative Embedding Loss including two parts: pull loss and push loss.
+    Pull loss makes embedding vectors from same object closer to each other.
+    Push loss distinguish embedding vector from different objects, and makes
+        the gap between them is large enough.
+
+    During computing, usually there are 3 cases:
+        - no object in image: both pull loss and push loss will be 0.
+        - one object in image: push loss will be 0 and pull loss is computed
+            by the two corner of the only object.
+        - more than one objects in image: pull loss is computed by corner pairs
+            from each object, push loss is computed by each object with all
+            other objects. We use confusion matrix with 0 in diagonal to
+            compute the push loss.
+
+    Args:
+        tl_preds (tensor): Embedding feature map of left-top corner.
+        br_preds (tensor): Embedding feature map of bottim-right corner.
+        match (list): Downsampled coordinates pair of each ground truth box.
+    """
+
+    tl_list, br_list, me_list = [], [], []
+    if len(match) == 0:  # no object in image
+      

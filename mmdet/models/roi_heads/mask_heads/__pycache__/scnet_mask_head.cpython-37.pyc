@@ -1,0 +1,33 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+import torch
+from mmcv.runner import force_fp32
+
+from mmdet.models.builder import ROI_EXTRACTORS
+from .base_roi_extractor import BaseRoIExtractor
+
+
+@ROI_EXTRACTORS.register_module()
+class SingleRoIExtractor(BaseRoIExtractor):
+    """Extract RoI features from a single level feature map.
+
+    If there are multiple input feature levels, each RoI is mapped to a level
+    according to its scale. The mapping rule is proposed in
+    `FPN <https://arxiv.org/abs/1612.03144>`_.
+
+    Args:
+        roi_layer (dict): Specify RoI layer type and arguments.
+        out_channels (int): Output channels of RoI layers.
+        featmap_strides (List[int]): Strides of input feature maps.
+        finest_scale (int): Scale threshold of mapping to level 0. Default: 56.
+        init_cfg (dict or list[dict], optional): Initialization config dict.
+            Default: None
+    """
+
+    def __init__(self,
+                 roi_layer,
+                 out_channels,
+                 featmap_strides,
+                 finest_scale=56,
+                 init_cfg=None):
+        super(SingleRoIExtractor, self).__init__(roi_layer, out_channels,
+                              
